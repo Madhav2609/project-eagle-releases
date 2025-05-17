@@ -14,13 +14,11 @@ import subprocess
 import requests
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-import stat
 import winreg
-import urllib.request
 import shutil
 import ctypes
 import re
-import glob
+import stat
 
 # Try importing PIL, handle gracefully if not available
 try:
@@ -118,6 +116,28 @@ def extract_with_7zr(archive_path, dest_dir, progress_callback=None):
     if proc.returncode != 0:
         raise RuntimeError(f"7zr failed (code {proc.returncode})")
 
+def clear_readonly_chmod(root_path):
+    """
+    Walk `root_path` and ensure every file or directory is writable
+    by setting the owner-write bit.
+    """
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        # process directories
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            try:
+                mode = os.stat(full).st_mode
+                os.chmod(full, mode | stat.S_IWRITE)
+            except Exception as e:
+                print(f"Warning: could not chmod {full}: {e}")
+        # process files
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            try:
+                mode = os.stat(full).st_mode
+                os.chmod(full, mode | stat.S_IWRITE)
+            except Exception as e:
+                print(f"Warning: could not chmod {full}: {e}")
 
 # ——— APPLICATION ——————————————————————————————————————————————
 
@@ -668,8 +688,18 @@ class InstallPage(BasePage):
 
             self.log("Download complete")
 
-            # Extract and merge phase (50% of total progress)
+            # Remove readonly flags from game directory before installation
             self.phase = "installing"
+            self.log("Preparing game directory...")
+            self.current_file = "Removing readonly flags..."
+            
+            try:
+                clear_readonly_chmod(self.ctrl.game_path)
+                self.log("Removed readonly flags from game directory")
+            except Exception as e:
+                self.log(f"Warning: Could not remove all readonly flags: {e}")
+
+            # Extract and merge phase (50% of total progress)
             self.log("Extracting into temporary directory...")
             
             def on_progress(p, status):
@@ -694,14 +724,44 @@ class InstallPage(BasePage):
                     for name in os.listdir(root_folder):
                         src = os.path.join(root_folder, name)
                         dst = os.path.join(self.ctrl.game_path, name)
-                        # Remove any existing file or directory at dst
+                        
+                        # Remove readonly flag from destination if it exists
                         if os.path.exists(dst):
+                            # Remove readonly attribute using Windows attrib command
+                            try:
+                                if os.path.isfile(dst):
+                                    subprocess.run(['attrib', '-R', dst], 
+                                        check=True, 
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                                elif os.path.isdir(dst):
+                                    # Remove readonly from directory and all contents
+                                    subprocess.run(['attrib', '-R', '/S', '/D', dst], 
+                                        check=True, 
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                            except subprocess.CalledProcessError as e:
+                                self.log(f"Warning: Could not remove readonly flag from {dst}: {e}")
+
+                            # Now remove the destination
                             if os.path.isdir(dst):
                                 shutil.rmtree(dst)
                             else:
                                 os.remove(dst)
+
                         # Move the extracted item into place
                         shutil.move(src, dst)
+                        
+                        # Ensure the moved file/directory is not readonly
+                        try:
+                            if os.path.isfile(dst):
+                                subprocess.run(['attrib', '-R', dst], 
+                                    check=True,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+                            elif os.path.isdir(dst):
+                                subprocess.run(['attrib', '-R', '/S', '/D', dst], 
+                                    check=True,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+                        except subprocess.CalledProcessError as e:
+                            self.log(f"Warning: Could not remove readonly flag after move for {dst}: {e}")
                 else:
                     self.log("Warning: Unexpected archive structure")
                     raise RuntimeError("Archive does not have the expected root folder structure")
