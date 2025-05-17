@@ -8,7 +8,6 @@ Themed Mod Installer for GTA Stars & Stripes / Project Eagle
 import os
 import sys
 import threading
-import tarfile
 import tempfile
 import time
 import subprocess
@@ -20,6 +19,8 @@ import winreg
 import urllib.request
 import shutil
 import ctypes
+import re
+import glob
 
 # Try importing PIL, handle gracefully if not available
 try:
@@ -41,8 +42,8 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 # ——— CONFIGURATION —————————————————————————————————————————
-MOD_ARCHIVE_URL      = "https://github.com/Madhav2609/project-eagle-releases/releases/download/1.0/project.eagle.tar.xz"
-ARCHIVE_NAME         = "project.eagle.tar.xz"
+MOD_ARCHIVE_URL      = "https://drive.usercontent.google.com/download?id=1z8tzpoZb6ipJhzKLU6_ZhyVjG0c_8cTi&export=download&authuser=0&confirm=t&uuid=1c478b14-d990-4768-adf1-d3d7419419ca&at=ALoNOglPpYQe3YXSwFdSWom8Jr8w%3A1747288331843"
+ARCHIVE_NAME         = "V2-Snapshot1.1-GTAPE.7z"
 EXPECTED_EXECUTABLE  = "gta_sa.exe"
 
 BLACKLISTED_FILES = [
@@ -73,6 +74,50 @@ def page_title(text):
 
 def page_label(text,size=13):
     return {"font":("Segoe UI", size), "text_color":TEXT_COLOR, "text":text}
+
+def get_bundled_path(filename):
+    """Return full path to a data file bundled by PyInstaller (using sys._MEIPASS)."""
+    if getattr(sys, 'frozen', False):
+        # Running in PyInstaller bundle
+        return os.path.join(sys._MEIPASS, filename)
+    else:
+        # Running in normal Python environment
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+def extract_with_7zr(archive_path, dest_dir, progress_callback=None):
+    """
+    Extract archive using bundled 7zr.exe, suppress normal messages (-bso0)
+    and emit progress percentages (-bsp1) that 7zr prints on stdout.
+    """
+    cmd = [
+        get_bundled_path('7zr.exe'),
+        'x', archive_path,
+        f'-o{dest_dir}',
+        '-y',       # assume Yes on all prompts
+        '-bso0',    # no ordinary output
+        '-bsp1',    # send progress (%) to stdout
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+
+    for line in proc.stdout:
+        # look for lines like " 45%" or "100%"
+        if pct := re.search(r'(\d+)%', line):
+            p = int(pct.group(1)) / 100.0
+            if progress_callback:
+                # map 0–1.0 of extraction into whatever UI range you want
+                progress_callback(p, line.strip())
+
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"7zr failed (code {proc.returncode})")
+
 
 # ——— APPLICATION ——————————————————————————————————————————————
 
@@ -556,6 +601,7 @@ class InstallPage(BasePage):
         self.phase = "waiting"  # waiting, downloading, preparing, installing
         self.speed = 0.0
         self.current_file = ""
+        self.current_filename = ""  # Add this line to track current file
         self.prep_start_time = 0
         self.after(100, self.refresh_ui)
 
@@ -597,7 +643,10 @@ class InstallPage(BasePage):
                 messagebox.showerror("Error", "Please select game folder first")
                 return
 
-            # Download Phase (45% of total progress)
+            # Only import what's not already imported at the top
+            from tempfile import TemporaryDirectory
+
+            # Download Phase (50% of total progress) 
             self.phase = "downloading"
             self.log("Starting download...")
             temp = os.path.join(tempfile.gettempdir(), ARCHIVE_NAME)
@@ -612,73 +661,70 @@ class InstallPage(BasePage):
                         if not chunk: continue
                         f.write(chunk)
                         dl += len(chunk)
-                        self.progress = (dl/total if total else 0) * 0.45  # Adjusted to 45%
+                        self.progress = (dl/total if total else 0) * 0.5
                         elapsed = time.time() - t0
                         self.speed = dl/elapsed if elapsed > 0 else 0
                         self.current_file = f"Downloading {ARCHIVE_NAME}"
 
             self.log("Download complete")
-            self.phase = "preparing"
-            self.prep_start_time = time.time()
-            self.current_file = "Preparing for extraction..."
-            self.log("Starting extraction preparation...")
+
+            # Extract and merge phase (50% of total progress)
+            self.phase = "installing"
+            self.log("Extracting into temporary directory...")
             
-            with tarfile.open(temp, "r:xz") as tar:
-                members = tar.getmembers()
-                total_members = len(members)
-                self.log(f"Found {total_members} files to extract")
-                
-                # Find the common root directory if it exists
-                paths = [m.name.split('/') for m in members]
-                common_prefix = os.path.commonpath([p[0] for p in paths if p]) if paths else ''
-                
-                # Count actual files (excluding root dir)
-                actual_files = sum(1 for m in members if m.name != common_prefix and m.name)
-                self.log(f"Starting extraction of {actual_files} files...")
-                
-                extracted = 0
-                self.phase = "installing"
-                for member in members:
-                    if member.name == common_prefix or not member.name:
-                        continue
-                        
-                    if common_prefix and member.name.startswith(common_prefix + '/'):
-                        member.name = member.name[len(common_prefix) + 1:]
-                    
-                    # Calculate progress from 55% to 100% based on files extracted
-                    extracted += 1
-                    self.progress = 0.55 + ((extracted / actual_files) * 0.45)
-                    
-                    file_name = os.path.basename(member.name)
-                    self.current_file = f"Installing: {file_name} ({extracted}/{actual_files})"
-                    self.log(f"Extracting: {member.name}")
-                    
-                    # build the full destination path
-                    dest = os.path.join(self.ctrl.game_path, member.name)
-                    # if there's already a file and it's read-only, clear that bit
-                    if os.path.exists(dest):
-                        os.chmod(dest,
-                                 os.stat(dest).st_mode    # grab current perms
-                                 | stat.S_IWRITE)         # add owner-write
-                    
-                    tar.extract(member, path=self.ctrl.game_path)
-                    extracted_path = os.path.join(self.ctrl.game_path, member.name)
-                    self._ensure_normal_permissions(extracted_path)
+            def on_progress(p, status):
+                overall = 0.5 + p * 0.5  # Map 0-1 to 50%-100%
+                self.progress = overall
+                self.current_file = f"Extracting: {status}"
+                self.progress_bar.set(overall)
+                self.progress_pct.configure(text=f"{overall*100:.1f}%")
+                self.status_lbl.configure(text=self.current_file)
+                self.update_idletasks()
 
-                # Try to cleanup the temp file
-                try:
-                    os.remove(temp)
-                except:
-                    pass
+            with TemporaryDirectory(prefix="PE_inst_") as tmpdir:
+                # Extract all files into tmpdir using existing helper and progress callback
+                extract_with_7zr(temp, tmpdir, on_progress)
+                self.log("Merging files into game folder...")
+                
+                # Find the root folder (V2-Snapshot1.1-GTAPE)
+                contents = os.listdir(tmpdir)
+                if len(contents) == 1 and os.path.isdir(os.path.join(tmpdir, contents[0])):
+                    root_folder = os.path.join(tmpdir, contents[0])
+                    # Merge contents of root folder
+                    for name in os.listdir(root_folder):
+                        src = os.path.join(root_folder, name)
+                        dst = os.path.join(self.ctrl.game_path, name)
+                        # Remove any existing file or directory at dst
+                        if os.path.exists(dst):
+                            if os.path.isdir(dst):
+                                shutil.rmtree(dst)
+                            else:
+                                os.remove(dst)
+                        # Move the extracted item into place
+                        shutil.move(src, dst)
+                else:
+                    self.log("Warning: Unexpected archive structure")
+                    raise RuntimeError("Archive does not have the expected root folder structure")
+    
+            self.log("Extraction & merge complete!")
 
-                self.current_file = "Installation complete!"
-                self.log("Installation complete")
-                self.progress = 1.0
-                self.phase = "complete"
-                self.ctrl.install_ok = True
-                self.ctrl.install_success = True
-                self.next_btn.configure(state="normal")
-                messagebox.showinfo("Success", "Mod installed successfully!")
+            # Set permissions on installed files
+            self.current_file = "Setting file permissions..."
+            self.log("Setting file permissions...")
+            for root, dirs, files in os.walk(self.ctrl.game_path):
+                for d in dirs:
+                    self._ensure_normal_permissions(os.path.join(root, d))
+                for f in files:
+                    self._ensure_normal_permissions(os.path.join(root, f))
+
+            self.current_file = "Installation complete!"
+            self.log("Installation complete")
+            self.progress = 1.0
+            self.phase = "complete"
+            self.ctrl.install_ok = True
+            self.ctrl.install_success = True
+            self.next_btn.configure(state="normal")
+            messagebox.showinfo("Success", "Mod installed successfully!")
 
         except Exception as e:
             self.log(f"Error: {e}")
@@ -687,6 +733,11 @@ class InstallPage(BasePage):
             self.ctrl.install_ok = False
             self.ctrl.install_success = False
         finally:
+            # Cleanup temp file
+            try:
+                os.remove(temp)
+            except:
+                pass
             self.after(0, lambda: self.start_btn.configure(state="normal"))
 
     def refresh_ui(self):
@@ -697,14 +748,12 @@ class InstallPage(BasePage):
         # Update status text based on phase
         if self.phase == "downloading":
             self.status_lbl.configure(text=f"{self.current_file} - {self._hr_size(self.speed)}/s")
-        elif self.phase == "preparing":
-            # Show simulated progress during preparation
-            elapsed = time.time() - self.prep_start_time
-            sim_progress = min(1.0, elapsed / 150.0)  # Simulate ~150 seconds for preparation
-            self.progress = 0.45 + (sim_progress * 0.1)  # Use 10% for preparation phase
-            self.status_lbl.configure(text=self.current_file)
         elif self.phase == "installing":
             self.status_lbl.configure(text=self.current_file)
+            if hasattr(self, 'current_filename') and self.current_filename:
+                self.logbox.configure(state="normal")
+                self.logbox.see("end")
+                self.logbox.configure(state="disabled")
         elif self.phase == "complete":
             self.status_lbl.configure(text="Installation Complete!")
         elif self.phase == "error":
