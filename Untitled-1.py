@@ -15,10 +15,8 @@ import requests
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import winreg
-import shutil
 import ctypes
 import re
-import stat
 
 # Try importing PIL, handle gracefully if not available
 try:
@@ -83,28 +81,42 @@ def get_bundled_path(filename):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
-def clear_readonly_chmod(root_path):
-    """
-    Walk `root_path` and ensure every file or directory is writable
-    by setting the owner-write bit.
-    """
-    for dirpath, dirnames, filenames in os.walk(root_path):
-        # process directories
-        for name in dirnames:
-            full = os.path.join(dirpath, name)
-            try:
-                mode = os.stat(full).st_mode
-                os.chmod(full, mode | stat.S_IWRITE)
-            except Exception as e:
-                print(f"Warning: could not chmod {full}: {e}")
-        # process files
-        for name in filenames:
-            full = os.path.join(dirpath, name)
-            try:
-                mode = os.stat(full).st_mode
-                os.chmod(full, mode | stat.S_IWRITE)
-            except Exception as e:
-                print(f"Warning: could not chmod {full}: {e}")
+
+def extract_with_7zr(archive_path, dest_dir, progress_callback=None):
+    """Extract archive using bundled 7zr.exe, with improved error handling"""
+    cmd = [
+        get_bundled_path('7zr.exe'),
+        'x', archive_path,
+        f'-o{dest_dir}',
+        '-y',       # assume Yes on all prompts
+        '-bso0',    # no ordinary output
+        '-bsp1',    # send progress (%) to stdout
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,  # Capture stderr too
+            text=True,
+            bufsize=1,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        for line in proc.stdout:
+            if pct := re.search(r'(\d+)%', line):
+                p = int(pct.group(1)) / 100.0
+                if progress_callback:
+                    progress_callback(p, line.strip())
+
+        proc.wait()
+        if proc.returncode != 0:
+            # Get error output if available
+            error_output = proc.stderr.read() if proc.stderr else ""
+            raise RuntimeError(f"7zr failed (code {proc.returncode}): {error_output}")
+
+    except Exception as e:
+        raise RuntimeError(f"Extraction failed: {str(e)}")
 
 # ——— APPLICATION ——————————————————————————————————————————————
 
@@ -598,31 +610,10 @@ class InstallPage(BasePage):
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
-    def start(self):
+    def start(self):  # Remove the 'msg' parameter
         self.start_btn.configure(state="disabled")
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def _ensure_normal_permissions(self, path):  
-        """Set normal Windows file permissions for installed files"""
-        try:
-            if os.path.isfile(path):
-                # Grant read+execute to Everyone on a file
-                subprocess.run(
-                    ['icacls', path, '/grant', 'Everyone:RX'],
-                    capture_output=True, check=True,
-                    creationflags=0x08000000
-                )
-            elif os.path.isdir(path):
-                # Grant full control (with inheritance) on a directory tree
-                subprocess.run(
-                    ['icacls', path, '/grant', 'Everyone:(OI)(CI)F', '/T'],
-                    capture_output=True, check=True,
-                    creationflags=0x08000000
-                )
-        except subprocess.CalledProcessError as e:
-            self.log(f"Warning: icacls failed on {path}: {e.stderr.decode()}")
-        except Exception as e:
-            self.log(f"Warning: Could not set permissions for {path}: {e}")
 
     def _worker(self):
         try:
@@ -664,118 +655,27 @@ class InstallPage(BasePage):
 
                 # Only proceed with installation if download was successful
                 if os.path.exists(temp):
-                    # Remove readonly flags from game directory before installation
                     self.phase = "installing"
-                    self.log("Preparing game directory...")
-                    self.current_file = "Removing readonly flags..."
-                    
-                    try:
-                        clear_readonly_chmod(self.ctrl.game_path)
-                        self.log("Removed readonly flags from game directory")
-                    except Exception as e:
-                        self.log(f"Warning: Could not remove all readonly flags: {e}")
+                    self.log("Extracting mod files into game folder…")
 
-                    def extract_with_7zr(archive_path, dest_dir, progress_callback=None):
-                        """Extract archive using bundled 7zr.exe, with improved error handling"""
-                        cmd = [
-                            get_bundled_path('7zr.exe'),
-                            'x', archive_path,
-                            f'-o{dest_dir}',
-                            '-y',       # assume Yes on all prompts
-                            '-bso0',    # no ordinary output
-                            '-bsp1',    # send progress (%) to stdout
-                        ]
-
-                        try:
-                            proc = subprocess.Popen(
-                                cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,  # Capture stderr too
-                                text=True,
-                                bufsize=1,
-                                creationflags=subprocess.CREATE_NO_WINDOW
-                            )
-
-                            for line in proc.stdout:
-                                if pct := re.search(r'(\d+)%', line):
-                                    p = int(pct.group(1)) / 100.0
-                                    if progress_callback:
-                                        progress_callback(p, line.strip())
-
-                            proc.wait()
-                            if proc.returncode != 0:
-                                # Get error output if available
-                                error_output = proc.stderr.read() if proc.stderr else ""
-                                raise RuntimeError(f"7zr failed (code {proc.returncode}): {error_output}")
-
-                        except Exception as e:
-                            raise RuntimeError(f"Extraction failed: {str(e)}")
-
-                    # Extract and merge phase (50% of total progress)
-                    self.log("Extracting into temporary directory...")
-                    
                     def on_progress(p, status):
                         overall = 0.5 + p * 0.5  # Map 0-1 to 50%-100%
                         self.progress = overall
-                        self.current_file = f"Extracting: {status}"
+                        self.current_file = status
                         self.progress_bar.set(overall)
                         self.progress_pct.configure(text=f"{overall*100:.1f}%")
-                        self.status_lbl.configure(text=self.current_file)
+                        self.status_lbl.configure(text=status)
                         self.update_idletasks()
 
-                    with TemporaryDirectory(prefix="PE_inst_") as tmpdir:
-                        # Extract all files into tmpdir using existing helper and progress callback
-                        extract_with_7zr(temp, tmpdir, on_progress)
-                        self.log("Merging files into game folder...")
-                        
-                        # Find the root folder (V2-Snapshot1.1-GTAPE)
-                        contents = os.listdir(tmpdir)
-                        if len(contents) == 1 and os.path.isdir(os.path.join(tmpdir, contents[0])):
-                            root_folder = os.path.join(tmpdir, contents[0])
-                            # Merge contents of root folder
-                            for name in os.listdir(root_folder):
-                                src = os.path.join(root_folder, name)
-                                dst = os.path.join(self.ctrl.game_path, name)
-                                
-                                # Remove readonly flag from destination if it exists
-                                if os.path.exists(dst):
-                                    try:
-                                        if os.path.isfile(dst):
-                                            subprocess.run(['attrib', '-R', dst], 
-                                                check=True, 
-                                                creationflags=subprocess.CREATE_NO_WINDOW)
-                                        elif os.path.isdir(dst):
-                                            subprocess.run(['attrib', '-R', '/S', '/D', dst], 
-                                                check=True, 
-                                                creationflags=subprocess.CREATE_NO_WINDOW)
-                                    except subprocess.CalledProcessError as e:
-                                        self.log(f"Warning: Could not remove readonly flag from {dst}: {e}")
-
-                                    # Now remove the destination
-                                    if os.path.isdir(dst):
-                                        shutil.rmtree(dst)
-                                    else:
-                                        os.remove(dst)
-
-                                # Move the extracted item into place
-                                shutil.move(src, dst)
-                                
-                                # Ensure the moved file/directory is not readonly
-                                try:
-                                    if os.path.isfile(dst):
-                                        subprocess.run(['attrib', '-R', dst], 
-                                            check=True,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                                    elif os.path.isdir(dst):
-                                        subprocess.run(['attrib', '-R', '/S', '/D', dst], 
-                                            check=True,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                                except subprocess.CalledProcessError as e:
-                                    self.log(f"Warning: Could not remove readonly flag after move for {dst}: {e}")
-                        else:
-                            self.log("Warning: Unexpected archive structure")
-                            raise RuntimeError("Archive does not have the expected root folder structure")
-        
+                    extract_with_7zr(temp, self.ctrl.game_path, on_progress)
+                    self.log("Extraction complete!")
+                    
+                    # Add these lines after extraction is done:
+                    self.phase = "complete"
+                    self.progress = 1.0  # Set progress to 100%
+                    self.ctrl.install_ok = True
+                    self.ctrl.install_success = True
+                    self.next_btn.configure(state="normal")  # Enable the Next button
                 else:
                     raise Exception("Download failed - temporary file not created")
 
