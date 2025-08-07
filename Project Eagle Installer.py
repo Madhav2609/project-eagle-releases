@@ -80,6 +80,124 @@ def get_bundled_path(filename):
         # Running in normal Python environment
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
+def download_with_resume(url, dest_file, log_func=None, status_update_func=None, progress_update_func=None, speed_update_func=None, pause_check_func=None):
+    """Download a file with resume support and pause capability"""
+    headers = {}
+    if os.path.exists(dest_file):
+        file_size = os.path.getsize(dest_file)
+        headers['Range'] = f'bytes={file_size}-'
+        mode = 'ab'
+    else:
+        file_size = 0
+        mode = 'wb'
+
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            # Handle both partial content (206) and full content (200) responses
+            if r.status_code == 206:
+                # Partial content - get remaining size
+                content_range = r.headers.get('Content-Range', '')
+                if content_range:
+                    # Format: "bytes start-end/total"
+                    total_size = int(content_range.split('/')[-1])
+                else:
+                    total_size = int(r.headers.get('Content-Length', 0)) + file_size
+            else:
+                # Full content - server doesn't support range requests, restart download
+                file_size = 0
+                mode = 'wb'
+                total_size = int(r.headers.get('Content-Length', 0))
+            
+            downloaded = file_size
+            start_time = time.time()
+            pause_start = None
+            
+            if status_update_func:
+                status_update_func(f"Downloading {os.path.basename(dest_file)}")
+                
+            with open(dest_file, mode) as f:
+                for chunk in r.iter_content(chunk_size=64*1024):  # 64KB chunks for better performance
+                    # Check for pause
+                    if pause_check_func:
+                        while pause_check_func():
+                            if pause_start is None:
+                                pause_start = time.time()
+                            time.sleep(0.1)  # Check every 100ms
+                        
+                        # If we were paused, adjust the start time
+                        if pause_start is not None:
+                            start_time += (time.time() - pause_start)
+                            pause_start = None
+                    
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Calculate and update speed
+                        elapsed = time.time() - start_time
+                        if elapsed > 0 and speed_update_func:
+                            speed = downloaded / elapsed
+                            speed_update_func(speed)
+                        
+                        if progress_update_func and total_size:
+                            progress_update_func(downloaded / total_size)
+    except (requests.exceptions.RequestException, requests.exceptions.ConnectionError) as e:
+        # Re-raise with more specific information
+        if "IncompleteRead" in str(e) or "Connection broken" in str(e):
+            raise requests.exceptions.ConnectionError(f"Download interrupted at {downloaded} bytes: {str(e)}")
+        else:
+            raise
+    return True
+
+def download_with_retry(url, dest_file, retries=3, delay=5, log_func=None, status_update_func=None, progress_update_func=None, speed_update_func=None, pause_check_func=None):
+    """Download a file with retry logic and resume support"""
+    attempt = 0
+    while attempt < retries:
+        try:
+            if log_func:
+                if attempt > 0:
+                    log_func(f"Retry attempt {attempt + 1}/{retries} for download...")
+                else:
+                    log_func("Starting download...")
+                    
+            result = download_with_resume(
+                url, dest_file,
+                log_func=log_func,
+                status_update_func=status_update_func,
+                progress_update_func=progress_update_func,
+                speed_update_func=speed_update_func,
+                pause_check_func=pause_check_func
+            )
+            
+            if log_func:
+                log_func("Download completed successfully!")
+            return result
+            
+        except (requests.exceptions.RequestException, 
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                Exception) as e:
+            error_msg = str(e)
+            if "IncompleteRead" in error_msg or "Connection broken" in error_msg:
+                if log_func:
+                    log_func(f"Download interrupted: {error_msg}")
+                    log_func("This is normal for large files - will resume automatically...")
+            else:
+                if log_func:
+                    log_func(f"Download attempt {attempt + 1} failed: {error_msg}")
+            
+            attempt += 1
+            
+            if attempt < retries:
+                if log_func:
+                    log_func(f"Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+            else:
+                if log_func:
+                    log_func(f"All {retries} download attempts failed")
+                    
+    return False
 
 
 def extract_with_7zr(archive_path, dest_dir, progress_callback=None):
@@ -592,6 +710,10 @@ class InstallPage(BasePage):
         ctl.pack(pady=5)
         self.start_btn = styled_btn(ctl, text="Start ▶", command=self.start)
         self.start_btn.pack(side="left", padx=5)
+        self.pause_btn = styled_btn(ctl, text="Pause ⏸", state="disabled", command=self.pause)
+        self.pause_btn.pack(side="left", padx=5)
+        self.resume_btn = styled_btn(ctl, text="Resume ▶", state="disabled", command=self.resume)
+        self.resume_btn.pack(side="left", padx=5)
         self.next_btn = styled_btn(ctl, text="Next ▶", state="disabled", command=lambda: controller.show_tab("Finish"))
         self.next_btn.pack(side="left", padx=5)
 
@@ -602,6 +724,9 @@ class InstallPage(BasePage):
         self.current_file = ""
         self.current_filename = ""  # Add this line to track current file
         self.prep_start_time = 0
+        self.is_paused = False
+        self.worker_thread = None
+        self.should_stop = False
         self.after(100, self.refresh_ui)
 
     def log(self, msg):
@@ -612,7 +737,28 @@ class InstallPage(BasePage):
 
     def start(self):  # Remove the 'msg' parameter
         self.start_btn.configure(state="disabled")
-        threading.Thread(target=self._worker, daemon=True).start()
+        self.pause_btn.configure(state="normal")
+        self.is_paused = False
+        self.should_stop = False
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.worker_thread.start()
+
+    def pause(self):
+        self.is_paused = True
+        self.pause_btn.configure(state="disabled")
+        self.resume_btn.configure(state="normal")
+        self.log("Download paused")
+        self.status_lbl.configure(text="Download paused")
+
+    def resume(self):
+        self.is_paused = False
+        self.pause_btn.configure(state="normal")
+        self.resume_btn.configure(state="disabled")
+        self.log("Download resumed")
+
+    def stop(self):
+        self.should_stop = True
+        self.is_paused = False
 
 
     def _worker(self):
@@ -636,20 +782,21 @@ class InstallPage(BasePage):
             self.log("Starting download...")
             
             try:
-                with requests.get(MOD_ARCHIVE_URL, stream=True) as r:
-                    r.raise_for_status()
-                    total = int(r.headers.get("Content-Length",0))
-                    dl = 0
-                    t0 = time.time()
-                    with open(temp, "wb") as f:
-                        for chunk in r.iter_content(64*1024):
-                            if not chunk: continue
-                            f.write(chunk)
-                            dl += len(chunk)
-                            self.progress = (dl/total if total else 0) * 0.5
-                            elapsed = time.time() - t0
-                            self.speed = dl/elapsed if elapsed > 0 else 0
-                            self.current_file = f"Downloading {ARCHIVE_NAME}"
+                # Use the new download function with retry capability
+                download_success = download_with_retry(
+                    MOD_ARCHIVE_URL, 
+                    temp,
+                    retries=3,
+                    delay=5,
+                    log_func=self.log,
+                    status_update_func=lambda msg: setattr(self, 'current_file', msg),
+                    progress_update_func=lambda p: setattr(self, 'progress', p * 0.5),  # Scale to 50% of total
+                    speed_update_func=lambda s: setattr(self, 'speed', s),
+                    pause_check_func=lambda: self.is_paused  # Add pause check
+                )
+                
+                if not download_success:
+                    raise Exception("Download failed after multiple retries")
 
                 self.log("Download complete")
 
@@ -679,8 +826,9 @@ class InstallPage(BasePage):
                 else:
                     raise Exception("Download failed - temporary file not created")
 
-            except requests.RequestException as e:
-                raise Exception(f"Download failed: {str(e)}")
+            except Exception as e:
+                # Handle any download or extraction errors
+                raise Exception(f"Installation failed: {str(e)}")
             
         except Exception as e:
             self.log(f"Error: {e}")
@@ -689,8 +837,8 @@ class InstallPage(BasePage):
             self.ctrl.install_ok = False
             self.ctrl.install_success = False
         finally:
-            # Only attempt cleanup if the temp file exists
-            if os.path.exists(temp):
+            # Only attempt cleanup if the temp file exists and installation is complete
+            if os.path.exists(temp) and self.phase == "complete":
                 try:
                     os.remove(temp)
                 except Exception as e:
@@ -704,7 +852,10 @@ class InstallPage(BasePage):
         
         # Update status text based on phase
         if self.phase == "downloading":
-            self.status_lbl.configure(text=f"{self.current_file} - {self._hr_size(self.speed)}/s")
+            if self.is_paused:
+                self.status_lbl.configure(text="Download paused")
+            else:
+                self.status_lbl.configure(text=f"{self.current_file} - {self._hr_size(self.speed)}/s")
         elif self.phase == "installing":
             self.status_lbl.configure(text=self.current_file)
             if hasattr(self, 'current_filename') and self.current_filename:
@@ -713,8 +864,12 @@ class InstallPage(BasePage):
                 self.logbox.configure(state="disabled")
         elif self.phase == "complete":
             self.status_lbl.configure(text="Installation Complete!")
+            self.pause_btn.configure(state="disabled")
+            self.resume_btn.configure(state="disabled")
         elif self.phase == "error":
             self.status_lbl.configure(text="Installation Failed")
+            self.pause_btn.configure(state="disabled")
+            self.resume_btn.configure(state="disabled")
         
         if self.phase != "complete" and self.phase != "error":
             self.after(100, self.refresh_ui)

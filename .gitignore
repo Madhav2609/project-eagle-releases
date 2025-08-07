@@ -1,0 +1,15 @@
+/__pycache__
+*.spec
+Project Eagle Installer.py
+Project Eagle Installer.py
+favicon.png
+dist/Project Eagle Installer.exe
+build_installer.py
+build/Project Eagle Installer/xref-Project Eagle Installer.html
+build/Project Eagle Installer/warn-Project Eagle Installer.txt
+*.toc
+*.pyz
+*.pkg
+*.pyc
+*.zip
+*.ico
